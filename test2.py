@@ -59,27 +59,42 @@ def unmarshal_dynamodb_value(dynamo_val: Dict[str, Any]) -> Any:
             return [unmarshal_dynamodb_value(elem) for elem in value]
         elif data_type == "SS":
             return set(value)
+        elif data_type == "NS":
+            # Number Set - convert each numeric string to int/float
+            return set(float(v) if "." in v else int(v) for v in value)
+        elif data_type == "BS":
+            # Binary Set - leave as list of base64-encoded strings
+            return list(value)
+        elif data_type == "B":
+            # Binary - leave as the raw (base64-encoded) string/bytes representation
+            return value
         else:
+            logger.warning(f"Encountered unrecognized DynamoDB attribute type '{data_type}' with value {value!r}; returning raw value as-is")
             return value
     return None
 
 def parse_record_envelope(raw_image: Dict[str, Any]) -> Dict[str, Any]:
+    """Converts a DynamoDB Stream NewImage/OldImage envelope (top-level dict of
+    {attr_name: {type_tag: value}}) into a plain Python dict.
+
+    unmarshal_dynamodb_value() already fully and recursively converts every
+    supported DynamoDB type wrapper (S, N, BOOL, NULL, M, L, SS, NS, BS, B)
+    into native Python types, so no second manual unmarshal pass is needed
+    or correct here. Attempting a second .items() pass on an already-unwrapped
+    scalar (str/int/float/bool) is what previously caused:
+    AttributeError: 'str' object has no attribute 'items'
+    """
     output = {}
     for key, val_wrapper in raw_image.items():
-        # First layer unwrapping works
-        unwrapped = unmarshal_dynamodb_value(val_wrapper)
+        if not (isinstance(val_wrapper, dict) and len(val_wrapper) == 1):
+            logger.warning(
+                f"Attribute '{key}' does not conform to expected single-key DynamoDB "
+                f"type-wrapper schema (got: {val_wrapper!r}); passing through unchanged"
+            )
+            output[key] = val_wrapper
+            continue
 
-        # FAILS HERE: The code attempts to traverse the unwrapped attribute as if it
-        # still retains the low-level {'S': '...'} schema wrapper dict
-        # If 'unwrapped' is a string or int, unwrapped.items() raises AttributeError
-        if isinstance(val_wrapper, dict) and "M" in val_wrapper:
-            output[key] = unwrapped
-        else:
-            # Buggy second unmarshal attempt assumes unwrapped is still a dictionary
-            second_pass = {}
-            for sub_k, sub_v in unwrapped.items():
-                second_pass[sub_k] = sub_v
-            output[key] = second_pass
+        output[key] = unmarshal_dynamodb_value(val_wrapper)
 
     return output
 
@@ -91,13 +106,27 @@ class StreamProcessorEngine:
         logger.info(f"Processing INSERT event for entity ID: {unmarshaled_record.get('id')}")
         self.metrics.inserted_count += 1
         amount = unmarshaled_record.get("transaction_amount", 0.0)
-        self.metrics.aggregated_volume += float(amount)
+        try:
+            self.metrics.aggregated_volume += float(amount)
+        except (TypeError, ValueError):
+            logger.warning(
+                f"Could not coerce transaction_amount={amount!r} to float for entity "
+                f"ID {unmarshaled_record.get('id')}; skipping volume contribution"
+            )
 
     def process_modify(self, old_record: Dict[str, Any], new_record: Dict[str, Any]) -> None:
         logger.info(f"Processing MODIFY event for entity ID: {new_record.get('id')}")
         self.metrics.modified_count += 1
-        delta = new_record.get("transaction_amount", 0.0) - old_record.get("transaction_amount", 0.0)
-        self.metrics.aggregated_volume += float(delta)
+        new_amount = new_record.get("transaction_amount", 0.0)
+        old_amount = old_record.get("transaction_amount", 0.0)
+        try:
+            delta = float(new_amount) - float(old_amount)
+            self.metrics.aggregated_volume += delta
+        except (TypeError, ValueError):
+            logger.warning(
+                f"Could not coerce transaction_amount old={old_amount!r} new={new_amount!r} "
+                f"to float for entity ID {new_record.get('id')}; skipping volume delta"
+            )
 
     def process_remove(self, old_record: Dict[str, Any]) -> None:
         logger.info(f"Processing REMOVE event for entity ID: {old_record.get('id')}")
@@ -109,7 +138,7 @@ class StreamProcessorEngine:
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     metrics = StreamMetricsBuffer()
     engine = StreamProcessorEngine(metrics)
-    
+
     logger.info("Starting processing batch of DynamoDB stream records...")
 
     # Realistic simulated DynamoDB Stream event
@@ -146,37 +175,58 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         ]
     }
 
-    records = synthetic_stream_event.get("Records", [])
+    # Use the real Lambda event payload when provided (standard DynamoDB Streams
+    # trigger shape), falling back to the synthetic sample for local/manual invocation.
+    records = event.get("Records") if isinstance(event, dict) and event.get("Records") else synthetic_stream_event.get("Records", [])
     logger.info(f"Batch contains {len(records)} stream events")
 
+    batch_item_failures: List[Dict[str, str]] = []
+
     for record in records:
-        event_name = record.get("eventName")
-        ddb_data = record.get("dynamodb", {})
+        event_id = record.get("eventID", "UNKNOWN")
+        try:
+            event_name = record.get("eventName")
+            ddb_data = record.get("dynamodb", {})
 
-        logger.info(f"Parsing envelope for event ID: {record.get('eventID')}")
+            logger.info(f"Parsing envelope for event ID: {event_id}")
 
-        if event_name == "INSERT":
-            raw_new = ddb_data.get("NewImage", {})
-            parsed_new = parse_record_envelope(raw_new)
-            engine.process_insert(parsed_new)
+            if event_name == "INSERT":
+                raw_new = ddb_data.get("NewImage", {})
+                parsed_new = parse_record_envelope(raw_new)
+                engine.process_insert(parsed_new)
 
-        elif event_name == "MODIFY":
-            raw_old = ddb_data.get("OldImage", {})
-            raw_new = ddb_data.get("NewImage", {})
-            parsed_old = parse_record_envelope(raw_old)
-            parsed_new = parse_record_envelope(raw_new)
-            engine.process_modify(parsed_old, parsed_new)
+            elif event_name == "MODIFY":
+                raw_old = ddb_data.get("OldImage", {})
+                raw_new = ddb_data.get("NewImage", {})
+                parsed_old = parse_record_envelope(raw_old)
+                parsed_new = parse_record_envelope(raw_new)
+                engine.process_modify(parsed_old, parsed_new)
 
-        elif event_name == "REMOVE":
-            raw_old = ddb_data.get("OldImage", {})
-            parsed_old = parse_record_envelope(raw_old)
-            engine.process_remove(parsed_old)
+            elif event_name == "REMOVE":
+                raw_old = ddb_data.get("OldImage", {})
+                parsed_old = parse_record_envelope(raw_old)
+                engine.process_remove(parsed_old)
+
+            else:
+                logger.warning(f"Skipping unrecognized eventName '{event_name}' for event ID: {event_id}")
+
+        except Exception:
+            logger.exception(f"Failed to process stream record with event ID: {event_id}; marking as batch item failure")
+            batch_item_failures.append({"itemIdentifier": event_id})
+            continue
 
     summary_metrics = metrics.dump_metrics()
-    logger.info(f"Batch processing completed successfully. Metrics: {summary_metrics}")
+    logger.info(f"Batch processing completed. Metrics: {summary_metrics}")
 
-    return {
+    response: Dict[str, Any] = {
         "statusCode": 200,
         "batch_size": len(records),
         "execution_summary": summary_metrics
     }
+
+    if batch_item_failures:
+        # Standard shape expected by Lambda Event Source Mapping for DynamoDB Streams
+        # partial batch response, so only failed records are retried.
+        response["batchItemFailures"] = batch_item_failures
+
+    return response
