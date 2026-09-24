@@ -64,23 +64,19 @@ def unmarshal_dynamodb_value(dynamo_val: Dict[str, Any]) -> Any:
     return None
 
 def parse_record_envelope(raw_image: Dict[str, Any]) -> Dict[str, Any]:
+    """Converts a full DynamoDB low-level image dict into a plain Python dict.
+
+    unmarshal_dynamodb_value already handles all attribute types (S, N, BOOL,
+    NULL, M, L, SS) recursively, so a single-pass assignment is sufficient.
+    The previous else-branch that called .items() on the already-unwrapped
+    scalar value was the source of the AttributeError crash.
+    """
     output = {}
     for key, val_wrapper in raw_image.items():
-        # First layer unwrapping works
+        # unmarshal_dynamodb_value fully resolves all nested structures;
+        # assign the result directly — no second-pass unwrapping is needed.
         unwrapped = unmarshal_dynamodb_value(val_wrapper)
-
-        # FAILS HERE: The code attempts to traverse the unwrapped attribute as if it
-        # still retains the low-level {'S': '...'} schema wrapper dict
-        # If 'unwrapped' is a string or int, unwrapped.items() raises AttributeError
-        if isinstance(val_wrapper, dict) and "M" in val_wrapper:
-            output[key] = unwrapped
-        else:
-            # Buggy second unmarshal attempt assumes unwrapped is still a dictionary
-            second_pass = {}
-            for sub_k, sub_v in unwrapped.items():
-                second_pass[sub_k] = sub_v
-            output[key] = second_pass
-
+        output[key] = unwrapped
     return output
 
 class StreamProcessorEngine:
@@ -149,34 +145,60 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     records = synthetic_stream_event.get("Records", [])
     logger.info(f"Batch contains {len(records)} stream events")
 
+    failed_record_count = 0
+
     for record in records:
+        event_id = record.get("eventID", "UNKNOWN")
         event_name = record.get("eventName")
         ddb_data = record.get("dynamodb", {})
 
-        logger.info(f"Parsing envelope for event ID: {record.get('eventID')}")
+        logger.info(f"Parsing envelope for event ID: {event_id}")
 
-        if event_name == "INSERT":
-            raw_new = ddb_data.get("NewImage", {})
-            parsed_new = parse_record_envelope(raw_new)
-            engine.process_insert(parsed_new)
+        try:
+            if event_name == "INSERT":
+                raw_new = ddb_data.get("NewImage", {})
+                if not raw_new:
+                    logger.warning(f"INSERT record {event_id} has no NewImage; skipping.")
+                    continue
+                parsed_new = parse_record_envelope(raw_new)
+                engine.process_insert(parsed_new)
 
-        elif event_name == "MODIFY":
-            raw_old = ddb_data.get("OldImage", {})
-            raw_new = ddb_data.get("NewImage", {})
-            parsed_old = parse_record_envelope(raw_old)
-            parsed_new = parse_record_envelope(raw_new)
-            engine.process_modify(parsed_old, parsed_new)
+            elif event_name == "MODIFY":
+                raw_old = ddb_data.get("OldImage", {})
+                raw_new = ddb_data.get("NewImage", {})
+                if not raw_old or not raw_new:
+                    logger.warning(f"MODIFY record {event_id} is missing OldImage or NewImage; skipping.")
+                    continue
+                parsed_old = parse_record_envelope(raw_old)
+                parsed_new = parse_record_envelope(raw_new)
+                engine.process_modify(parsed_old, parsed_new)
 
-        elif event_name == "REMOVE":
-            raw_old = ddb_data.get("OldImage", {})
-            parsed_old = parse_record_envelope(raw_old)
-            engine.process_remove(parsed_old)
+            elif event_name == "REMOVE":
+                raw_old = ddb_data.get("OldImage", {})
+                if not raw_old:
+                    logger.warning(f"REMOVE record {event_id} has no OldImage; skipping.")
+                    continue
+                parsed_old = parse_record_envelope(raw_old)
+                engine.process_remove(parsed_old)
+
+            else:
+                logger.warning(f"Unrecognised eventName '{event_name}' for record {event_id}; skipping.")
+
+        except (AttributeError, KeyError, TypeError) as exc:
+            failed_record_count += 1
+            logger.error(
+                f"Failed to process record eventID={event_id} eventName={event_name}: "
+                f"{type(exc).__name__}: {exc} | raw dynamodb payload: {json.dumps(ddb_data)}"
+            )
+            # Continue processing remaining records rather than aborting the whole batch.
+            continue
 
     summary_metrics = metrics.dump_metrics()
-    logger.info(f"Batch processing completed successfully. Metrics: {summary_metrics}")
+    logger.info(f"Batch processing completed. Metrics: {summary_metrics} | failed_records: {failed_record_count}")
 
     return {
         "statusCode": 200,
         "batch_size": len(records),
+        "failed_record_count": failed_record_count,
         "execution_summary": summary_metrics
     }
