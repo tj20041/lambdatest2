@@ -64,22 +64,31 @@ def unmarshal_dynamodb_value(dynamo_val: Dict[str, Any]) -> Any:
     return None
 
 def parse_record_envelope(raw_image: Dict[str, Any]) -> Dict[str, Any]:
-    output = {}
-    for key, val_wrapper in raw_image.items():
-        # First layer unwrapping works
-        unwrapped = unmarshal_dynamodb_value(val_wrapper)
+    """
+    Converts a full DynamoDB stream record image (NewImage/OldImage) from the
+    low-level {'S': ..., 'N': ..., 'M': {...}} wire format into a standard
+    Python dictionary.
 
-        # FAILS HERE: The code attempts to traverse the unwrapped attribute as if it
-        # still retains the low-level {'S': '...'} schema wrapper dict
-        # If 'unwrapped' is a string or int, unwrapped.items() raises AttributeError
-        if isinstance(val_wrapper, dict) and "M" in val_wrapper:
+    NOTE: unmarshal_dynamodb_value() already fully and recursively resolves
+    every attribute (including nested 'M' maps and 'L' lists) into native
+    Python types (str, int, float, bool, None, dict, list, set). There is no
+    need for a second unwrapping pass here - attempting to call .items() on
+    an already-resolved scalar (str/int/float/bool/None) is what previously
+    caused 'AttributeError: str object has no attribute items' for every
+    record containing simple scalar fields (id, account_id, status, etc.).
+    """
+    output: Dict[str, Any] = {}
+    if not isinstance(raw_image, dict):
+        logger.error(f"parse_record_envelope received a non-dict raw_image of type {type(raw_image)}; skipping")
+        return output
+
+    for key, val_wrapper in raw_image.items():
+        try:
+            unwrapped = unmarshal_dynamodb_value(val_wrapper)
             output[key] = unwrapped
-        else:
-            # Buggy second unmarshal attempt assumes unwrapped is still a dictionary
-            second_pass = {}
-            for sub_k, sub_v in unwrapped.items():
-                second_pass[sub_k] = sub_v
-            output[key] = second_pass
+        except Exception as exc:
+            logger.error(f"Failed to unmarshal attribute '{key}' (raw value: {val_wrapper!r}): {exc}")
+            output[key] = None
 
     return output
 
@@ -87,17 +96,31 @@ class StreamProcessorEngine:
     def __init__(self, metrics: StreamMetricsBuffer):
         self.metrics = metrics
 
+    @staticmethod
+    def _safe_amount(value: Any) -> float:
+        """Defensively coerces a transaction_amount value into a float, tolerating
+        None or non-numeric types that may slip through a malformed record."""
+        if value is None:
+            return 0.0
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            logger.error(f"Encountered non-numeric transaction_amount value: {value!r}; defaulting to 0.0")
+            return 0.0
+
     def process_insert(self, unmarshaled_record: Dict[str, Any]) -> None:
         logger.info(f"Processing INSERT event for entity ID: {unmarshaled_record.get('id')}")
         self.metrics.inserted_count += 1
-        amount = unmarshaled_record.get("transaction_amount", 0.0)
-        self.metrics.aggregated_volume += float(amount)
+        amount = self._safe_amount(unmarshaled_record.get("transaction_amount", 0.0))
+        self.metrics.aggregated_volume += amount
 
     def process_modify(self, old_record: Dict[str, Any], new_record: Dict[str, Any]) -> None:
         logger.info(f"Processing MODIFY event for entity ID: {new_record.get('id')}")
         self.metrics.modified_count += 1
-        delta = new_record.get("transaction_amount", 0.0) - old_record.get("transaction_amount", 0.0)
-        self.metrics.aggregated_volume += float(delta)
+        old_amount = self._safe_amount(old_record.get("transaction_amount", 0.0))
+        new_amount = self._safe_amount(new_record.get("transaction_amount", 0.0))
+        delta = new_amount - old_amount
+        self.metrics.aggregated_volume += delta
 
     def process_remove(self, old_record: Dict[str, Any]) -> None:
         logger.info(f"Processing REMOVE event for entity ID: {old_record.get('id')}")
@@ -109,7 +132,7 @@ class StreamProcessorEngine:
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     metrics = StreamMetricsBuffer()
     engine = StreamProcessorEngine(metrics)
-    
+
     logger.info("Starting processing batch of DynamoDB stream records...")
 
     # Realistic simulated DynamoDB Stream event
@@ -152,25 +175,35 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     for record in records:
         event_name = record.get("eventName")
         ddb_data = record.get("dynamodb", {})
+        event_id = record.get("eventID")
 
-        logger.info(f"Parsing envelope for event ID: {record.get('eventID')}")
+        logger.info(f"Parsing envelope for event ID: {event_id}")
 
-        if event_name == "INSERT":
-            raw_new = ddb_data.get("NewImage", {})
-            parsed_new = parse_record_envelope(raw_new)
-            engine.process_insert(parsed_new)
+        try:
+            if event_name == "INSERT":
+                raw_new = ddb_data.get("NewImage", {})
+                parsed_new = parse_record_envelope(raw_new)
+                engine.process_insert(parsed_new)
 
-        elif event_name == "MODIFY":
-            raw_old = ddb_data.get("OldImage", {})
-            raw_new = ddb_data.get("NewImage", {})
-            parsed_old = parse_record_envelope(raw_old)
-            parsed_new = parse_record_envelope(raw_new)
-            engine.process_modify(parsed_old, parsed_new)
+            elif event_name == "MODIFY":
+                raw_old = ddb_data.get("OldImage", {})
+                raw_new = ddb_data.get("NewImage", {})
+                parsed_old = parse_record_envelope(raw_old)
+                parsed_new = parse_record_envelope(raw_new)
+                engine.process_modify(parsed_old, parsed_new)
 
-        elif event_name == "REMOVE":
-            raw_old = ddb_data.get("OldImage", {})
-            parsed_old = parse_record_envelope(raw_old)
-            engine.process_remove(parsed_old)
+            elif event_name == "REMOVE":
+                raw_old = ddb_data.get("OldImage", {})
+                parsed_old = parse_record_envelope(raw_old)
+                engine.process_remove(parsed_old)
+
+            else:
+                logger.warning(f"Skipping unrecognized eventName '{event_name}' for event ID: {event_id}")
+
+        except Exception as exc:
+            # A single malformed record must not fail the entire batch invocation.
+            logger.error(f"Failed to process record (eventID={event_id}, eventName={event_name}): {exc}", exc_info=True)
+            continue
 
     summary_metrics = metrics.dump_metrics()
     logger.info(f"Batch processing completed successfully. Metrics: {summary_metrics}")
